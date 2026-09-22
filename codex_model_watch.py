@@ -22,6 +22,7 @@ import argparse
 import glob
 import json
 import os
+import random
 import sqlite3
 import sys
 import threading
@@ -35,7 +36,7 @@ APP_DIR = os.path.join(HOME, ".codex-model-watch")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
 
-g_lock = threading.Lock()
+g_lock = threading.RLock()
 g_last_scan = 0.0
 g_state = {"demo": False}
 
@@ -66,6 +67,8 @@ def db_connect(db_path):
         latency_ms INTEGER, safety_header TEXT, error TEXT);
     CREATE TABLE IF NOT EXISTS threads(
         thread_id TEXT PRIMARY KEY, requested TEXT);
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY, value TEXT);
     """)
     return conn
 
@@ -306,6 +309,91 @@ def run_probe(codex_home, model):
             "latency_ms": latency, "safety_header": safety, "error": error}
 
 
+# ---------------------------------------------------------------- 自动探针调度
+
+AUTO_MODELS = ["gpt-5.6-sol", "gpt-6-astra"]
+NO_QUOTA_KEYS = ("429", "capacity", "rate limit", "rate_limit", "rate-limit",
+                 "quota", "usage limit", "limit reached", "overloaded", "insufficient")
+g_auto: dict = {"next_ts": None}
+
+
+def setting_get(key, default=None):
+    with g_lock:
+        row = conn().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def setting_set(key, value):
+    with g_lock:
+        c = conn()
+        c.execute("""INSERT INTO settings(key,value) VALUES(?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, str(value)))
+        c.commit()
+
+
+def auto_enabled():
+    return setting_get("auto_enabled", "0") == "1"
+
+
+def set_auto_enabled(on, reason=None):
+    setting_set("auto_enabled", "1" if on else "0")
+    if reason is not None:
+        setting_set("auto_pause_reason", reason)
+    elif on:
+        setting_set("auto_pause_reason", "")
+
+
+def auto_state():
+    return {"enabled": auto_enabled(), "models": AUTO_MODELS,
+            "next_ts": g_auto.get("next_ts"),
+            "pause_reason": setting_get("auto_pause_reason") or ""}
+
+
+def is_no_quota(result):
+    err = ((result or {}).get("error") or "").lower()
+    return bool(err) and any(k in err for k in NO_QUOTA_KEYS)
+
+
+def next_hour_target(now=None):
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    hour = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, 0, 0, 0, 0, -1))
+    target = hour + 3600 + random.uniform(-5, 5)
+    if target <= now:
+        target += 3600
+    return target
+
+
+def auto_probe_loop():
+    while True:
+        try:
+            if not auto_enabled():
+                g_auto["next_ts"] = None
+                time.sleep(5)
+                continue
+            target = next_hour_target()
+            g_auto["next_ts"] = target
+            cancelled = False
+            while time.time() < target:
+                if not auto_enabled():
+                    cancelled = True
+                    break
+                time.sleep(min(2.0, max(0.05, target - time.time())))
+            if cancelled:
+                continue
+            g_auto["next_ts"] = None
+            for m in AUTO_MODELS:
+                if not auto_enabled():
+                    break
+                res = run_probe(g_args.codex_home, m)
+                if is_no_quota(res):
+                    set_auto_enabled(False, reason="自动暂停：%s 无量/容量（%s）" % (m, (res.get("error") or "")[:100]))
+                    break
+                time.sleep(random.uniform(1, 3))
+        except Exception:
+            time.sleep(30)
+
+
 # ---------------------------------------------------------------- 聚合输出
 
 def api_data(conn, days=0):
@@ -343,7 +431,23 @@ def api_data(conn, days=0):
     quota_hist = q("SELECT ts, primary_used, secondary_used FROM quota ORDER BY ts DESC LIMIT 48")
     probes = q("SELECT * FROM probes ORDER BY ts DESC LIMIT 100")
     probe_summary = conn.execute("""SELECT COUNT(*) n, COALESCE(SUM(swapped),0) swapped
-                                    FROM probes""").fetchone()
+                                     FROM probes""").fetchone()
+    pstats = {r["requested"]: r for r in q(
+        """SELECT requested, COUNT(*) total,
+                  COALESCE(SUM(CASE WHEN swapped=0 AND served<>'' THEN 1 ELSE 0 END),0) ok,
+                  COALESCE(SUM(swapped),0) swapped
+           FROM probes GROUP BY requested""")}
+    latest = {r["requested"]: r for r in q(
+        """SELECT p.requested, p.served, p.latency_ms, p.ts FROM probes p
+           JOIN (SELECT requested, MAX(ts) mts FROM probes GROUP BY requested) x
+             ON x.requested=p.requested AND x.mts=p.ts""")}
+    probe_stats = []
+    for m in list(AUTO_MODELS) + [k for k in pstats if k not in AUTO_MODELS]:
+        a, b = pstats.get(m, {}), latest.get(m, {})
+        probe_stats.append({"model": m, "served": b.get("served") or "",
+                            "ok": a.get("ok", 0), "swapped": a.get("swapped", 0),
+                            "total": a.get("total", 0),
+                            "last_latency_ms": b.get("latency_ms"), "last_ts": b.get("ts")})
     total_models = sum(m["turns"] for m in models) or 1
     for m in models:
         m["share"] = round(m["turns"] * 100.0 / total_models, 1)
@@ -360,6 +464,8 @@ def api_data(conn, days=0):
                   "history": list(reversed(quota_hist))},
         "probes": probes,
         "probe_summary": {"total": probe_summary["n"], "swapped": probe_summary["swapped"]},
+        "probe_stats": probe_stats,
+        "auto": auto_state(),
     }
 
 
@@ -475,7 +581,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if self.path.split("?")[0] == "/api/probe":
+        path0 = self.path.split("?")[0]
+        if path0 == "/api/auto":
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            action = (body.get("action") or "").strip()
+            if action == "start":
+                set_auto_enabled(True)
+            elif action == "pause":
+                set_auto_enabled(False, reason="手动暂停")
+            else:
+                self._json({"error": "action 必须是 start 或 pause"}, 400)
+                return
+            self._json(auto_state())
+            return
+        if path0 == "/api/probe":
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -544,6 +667,7 @@ def main():
         return
 
     server = ThreadingHTTPServer(("127.0.0.1", g_args.port), Handler)
+    threading.Thread(target=auto_probe_loop, daemon=True).start()
     url = "http://127.0.0.1:%d" % g_args.port
     print("[codex-model-watch] 面板地址: %s  （Ctrl+C 退出）" % url)
     if not g_args.no_open:
