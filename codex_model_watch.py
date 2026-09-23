@@ -311,7 +311,7 @@ def run_probe(codex_home, model):
 
 # ---------------------------------------------------------------- 自动探针调度
 
-AUTO_MODELS = ["gpt-5.6-sol", "gpt-6-astra"]
+AUTO_MODELS = ["gpt-6-sol", "gpt-6-astra"]
 NO_QUOTA_KEYS = ("429", "capacity", "rate limit", "rate_limit", "rate-limit",
                  "quota", "usage limit", "limit reached", "overloaded", "insufficient")
 g_auto: dict = {"next_ts": None}
