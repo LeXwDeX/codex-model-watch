@@ -23,10 +23,12 @@ import glob
 import json
 import os
 import random
+import signal
 import sqlite3
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +41,11 @@ BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
 g_lock = threading.RLock()
 g_last_scan = 0.0
 g_state = {"demo": False}
+
+
+def log(msg):
+    # 后台运行时 stdout 被重定向到文件，必须 flush，否则进程被杀时缓冲内容全部丢失
+    print("%s [codex-model-watch] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
 
 
 # ---------------------------------------------------------------- db
@@ -300,11 +307,11 @@ def run_probe(codex_home, model):
     latency = int((time.time() - t0) * 1000)
     swapped = 1 if (served and model and served != model) else 0
     row = (iso_now(), model, served, swapped, latency, safety, error)
-    conn = db_connect(db_path())
     with g_lock:
-        conn.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error) "
-                     "VALUES(?,?,?,?,?,?,?)", row)
-        conn.commit()
+        c = conn()
+        c.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error) "
+                  "VALUES(?,?,?,?,?,?,?)", row)
+        c.commit()
     return {"ts": row[0], "requested": model, "served": served, "swapped": bool(swapped),
             "latency_ms": latency, "safety_header": safety, "error": error}
 
@@ -391,6 +398,7 @@ def auto_probe_loop():
                     break
                 time.sleep(random.uniform(1, 3))
         except Exception:
+            log("自动探针线程异常（30 秒后重试）:\n" + traceback.format_exc())
             time.sleep(30)
 
 
@@ -655,10 +663,9 @@ def main():
         g_last_scan = time.time()
     n_turn = conn_.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
     n_probe = conn_.execute("SELECT COUNT(*) FROM probes").fetchone()[0]
-    print("[codex-model-watch] 已解析 %d 个文件，累计 %d 轮会话、%d 次探针" %
-          (stats.get("files", 0), n_turn, n_probe))
+    log("已解析 %d 个文件，累计 %d 轮会话、%d 次探针" % (stats.get("files", 0), n_turn, n_probe))
     if stats.get("note"):
-        print("[codex-model-watch] " + stats["note"])
+        log(str(stats["note"]))
     if g_args.scan_only:
         top = conn_.execute("""SELECT served, COUNT(*) n FROM turns GROUP BY served
                                ORDER BY n DESC LIMIT 5""").fetchall()
@@ -669,13 +676,30 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", g_args.port), Handler)
     threading.Thread(target=auto_probe_loop, daemon=True).start()
     url = "http://127.0.0.1:%d" % g_args.port
-    print("[codex-model-watch] 面板地址: %s  （Ctrl+C 退出）" % url)
+    log("面板地址: %s  （PID %d，Ctrl+C 退出）" % (url, os.getpid()))
     if not g_args.no_open:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    # 把"被谁杀的"写进日志：之前进程无声消失、日志为空，死因无从查起
+    def on_signal(signum, _frame):
+        name = signal.Signals(signum).name
+        if signum == signal.SIGHUP:
+            log("收到 SIGHUP（终端关闭/会话结束），忽略并继续运行")
+            return
+        log("收到 %s，退出" % name)
+        raise SystemExit(128 + signum)
+
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, on_signal)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye")
+        log("收到 Ctrl+C，退出")
+    except SystemExit:
+        raise
+    except BaseException:
+        log("服务主循环异常退出:\n" + traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
