@@ -20,15 +20,20 @@ codex-model-watch —— 本地监控 Codex 的模型使用、额度水位、容
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
+import re
 import signal
 import sqlite3
 import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +42,7 @@ HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".codex-model-watch")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
+MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 
 g_lock = threading.RLock()
 g_last_scan = 0.0
@@ -55,6 +61,7 @@ def db_connect(db_path):
     # 单进程多线程，统一用 g_lock 串行化；check_same_thread 关掉以复用连接
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS files(
         path TEXT PRIMARY KEY, offset INTEGER DEFAULT 0, size INTEGER DEFAULT 0,
@@ -244,7 +251,8 @@ def load_auth(codex_home):
     if not os.path.isfile(path):
         return None
     try:
-        auth = json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as handle:
+            auth = json.load(handle)
         tokens = auth.get("tokens") or {}
         tok = tokens.get("access_token")
         if not tok:
@@ -254,12 +262,21 @@ def load_auth(codex_home):
         return None
 
 
-def run_probe(codex_home, model):
+def auth_binding(codex_home, auth):
+    account = (auth or {}).get("account") or (auth or {}).get("token") or "signed-out"
+    return hashlib.sha256((os.path.realpath(codex_home) + "\0" + account).encode()).hexdigest()
+
+
+def run_probe(codex_home, model, expected_binding=None):
     import urllib.request
     import urllib.error
+    if g_state["demo"]:
+        return {"error": "演示模式不发送真实探针"}
     auth = load_auth(codex_home)
     if not auth:
         return {"error": "未找到 Codex 登录态（~/.codex/auth.json），请先用 Codex 登录"}
+    if expected_binding is not None and auth_binding(codex_home, auth) != expected_binding:
+        return {"error": "Codex 登录账户已变化，跳过本次自动探针"}
     body = json.dumps({
         "model": model,
         "instructions": "You are a helpful assistant.",
@@ -318,7 +335,198 @@ def run_probe(codex_home, model):
 
 # ---------------------------------------------------------------- 自动探针调度
 
-AUTO_MODELS = ["gpt-6-sol", "gpt-6-astra"]
+def normalize_models(rows):
+    """Only public picker entries; retain no account or auth data."""
+    models = {}
+    if not isinstance(rows, list):
+        return []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("visibility") != "list":
+            continue
+        slug = row.get("slug") or row.get("id")
+        if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", slug):
+            continue
+        name = row.get("display_name")
+        priority = row.get("priority")
+        models.setdefault(slug, {"slug": slug, "display_name": name[:128] if isinstance(name, str) else slug,
+                                 "priority": priority if isinstance(priority, int) else 9999,
+                                 "visibility": "list"})
+    return sorted(models.values(), key=lambda m: (m["priority"], m["slug"]))
+
+
+def latest_auto_models(models):
+    targets = []
+    for family in ("sol", "astra"):
+        candidates = []
+        for model in models:
+            match = re.fullmatch(r"gpt-(\d+(?:\.\d+)*)-" + family, model["slug"])
+            if match:
+                version = tuple(int(x) for x in match.group(1).split("."))
+                candidates.append((version, -model["priority"], model["slug"]))
+        if candidates:
+            targets.append(max(candidates)[2])
+    return targets
+
+
+class ModelCatalog:
+    """Refresh metadata in a separate thread. Never send an inference request."""
+    def __init__(self, codex_home, state_dir, demo=False):
+        self.codex_home = os.path.realpath(codex_home)
+        self.cache_path = os.path.join(state_dir, "models.json")
+        self.demo = demo
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.data = {"models": [], "source": "none", "status": "unavailable", "updated_at": None,
+                     "error": "", "refreshing": False, "verified": False}
+        self.binding = None
+        self.client_version = None
+        self._bootstrap()
+
+    def _context(self):
+        auth = load_auth(self.codex_home)
+        return auth, auth_binding(self.codex_home, auth)
+
+    @staticmethod
+    def _read(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _bootstrap(self):
+        if self.demo:
+            self.data.update(models=normalize_models([
+                {"slug": "gpt-6.1-sol", "visibility": "list", "priority": 0},
+                {"slug": "gpt-6-astra", "visibility": "list", "priority": 1}]),
+                source="demo", status="demo", updated_at=iso_now())
+            return
+        _, self.binding = self._context()
+        local = self._read(os.path.join(self.codex_home, "models_cache.json"))
+        version = local.get("client_version")
+        self.client_version = version if isinstance(version, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}", version) else None
+        # Codex's opaque cache identity cannot establish account availability.
+        models = normalize_models(local.get("models"))
+        if models:
+            self.data.update(models=models, source="codex-cache", status="unverified",
+                             updated_at=local.get("fetched_at"), verified=False)
+        saved = self._read(self.cache_path)
+        if (saved.get("binding") == self.binding and isinstance(saved.get("updated_at"), str)
+                and isinstance(saved.get("models"), list)):
+            models = normalize_models(saved.get("models"))
+            self.data.update(models=models, source="watch-cache", status="stale",
+                             updated_at=saved["updated_at"], verified=True)
+
+    def snapshot(self):
+        with self.lock:
+            # Switching accounts immediately revokes old availability, even before refresh.
+            if not self.demo and self._context()[1] != self.binding:
+                self.data = {"models": [], "source": "none", "status": "unavailable", "updated_at": None,
+                             "error": "Codex 登录账户已变化，等待刷新目录", "refreshing": False, "verified": False}
+                self.wake.set()
+            return dict(self.data, models=[dict(m) for m in self.data["models"]])
+
+    def auto_targets(self):
+        return self.auto_plan()[0]
+
+    def auto_plan(self):
+        with self.lock:
+            data = self.snapshot()
+            targets = latest_auto_models(data["models"]) if data["verified"] and not self.demo else []
+            return targets, self.binding
+
+    def refresh(self):
+        if self.demo:
+            return self.snapshot()
+        auth, binding = self._context()
+        with self.lock:
+            if binding != self.binding:
+                self.data = {"models": [], "source": "none", "status": "unavailable", "updated_at": None,
+                             "error": "", "refreshing": False, "verified": False}
+                self._bootstrap()
+            self.data["refreshing"] = True
+        try:
+            if not auth:
+                raise ValueError("未找到 Codex 登录态")
+            # Re-read version metadata; Codex upgrades require no application edit.
+            local = self._read(os.path.join(self.codex_home, "models_cache.json"))
+            version = local.get("client_version")
+            if isinstance(version, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}", version):
+                self.client_version = version
+            if not self.client_version:
+                raise ValueError("缺少 Codex 模型缓存中的 client_version；请先启动 Codex")
+            request = urllib.request.Request(MODELS_URL + "?" + urllib.parse.urlencode({"client_version": self.client_version}))
+            for key, value in (("Authorization", "Bearer " + auth["token"]),
+                               ("chatgpt-account-id", auth["account"]), ("originator", "codex_cli_rs"),
+                               ("User-Agent", "codex_cli_rs/" + self.client_version), ("Accept", "application/json")):
+                request.add_header(key, value)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = response.read(2_000_001)
+            if len(raw) > 2_000_000:
+                raise ValueError("模型目录响应过大")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise ValueError("模型目录响应格式无效")
+            models = normalize_models(payload["models"])
+            updated_at = iso_now()
+            # Do not publish a response fetched with a previous account's credentials.
+            if self._context()[1] != binding:
+                raise ValueError("刷新期间 Codex 登录账户发生变化")
+            with self.lock:
+                self.data.update(models=models, source="live", status="ready", updated_at=updated_at,
+                                 error="", verified=True)
+            try:
+                os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+                temp = self.cache_path + ".tmp"
+                with open(temp, "w", encoding="utf-8") as handle:
+                    json.dump({"binding": binding, "models": models, "updated_at": updated_at}, handle)
+                os.replace(temp, self.cache_path)
+            except OSError:
+                log("模型目录已更新，但持久缓存写入失败")
+        except Exception as exc:
+            # Do not expose backend bodies, account identifiers, or credential-bearing URLs.
+            if isinstance(exc, urllib.error.HTTPError):
+                error = "目录刷新 HTTP %d" % exc.code
+            elif isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError):
+                error = str(exc)[:160]
+            else:
+                error = "目录刷新失败（%s）；将保留已有目录" % type(exc).__name__
+            with self.lock:
+                self.data.update(status="stale" if self.data["verified"] else
+                                 ("unverified" if self.data["models"] else "unavailable"), error=error)
+        finally:
+            with self.lock:
+                self.data["refreshing"] = False
+        return self.snapshot()
+
+    def request_refresh(self):
+        if not self.demo:
+            self.wake.set()
+
+    def loop(self):
+        if self.demo:
+            return
+        while True:
+            self.wake.clear()
+            self.refresh()
+            self.wake.wait(300)
+
+
+g_catalog = None
+
+
+def catalog_state():
+    if g_catalog is not None:
+        return g_catalog.snapshot()
+    return {"models": [], "source": "none", "status": "unavailable", "updated_at": None,
+            "error": "目录尚未初始化", "refreshing": False, "verified": False}
+
+
+def auto_targets():
+    return g_catalog.auto_targets() if g_catalog is not None else []
+
+
 NO_QUOTA_KEYS = ("429", "capacity", "rate limit", "rate_limit", "rate-limit",
                  "quota", "usage limit", "limit reached", "overloaded", "insufficient")
 g_auto: dict = {"next_ts": None}
@@ -351,8 +559,10 @@ def set_auto_enabled(on, reason=None):
 
 
 def auto_state():
-    return {"enabled": auto_enabled(), "models": AUTO_MODELS,
+    targets = auto_targets()
+    return {"enabled": auto_enabled(), "models": targets,
             "next_ts": g_auto.get("next_ts"),
+            "waiting_for_catalog": not targets,
             "pause_reason": setting_get("auto_pause_reason") or ""}
 
 
@@ -389,10 +599,11 @@ def auto_probe_loop():
             if cancelled:
                 continue
             g_auto["next_ts"] = None
-            for m in AUTO_MODELS:
+            targets, binding = g_catalog.auto_plan() if g_catalog is not None else ([], None)
+            for m in targets:
                 if not auto_enabled():
                     break
-                res = run_probe(g_args.codex_home, m)
+                res = run_probe(g_args.codex_home, m, expected_binding=binding)
                 if is_no_quota(res):
                     set_auto_enabled(False, reason="自动暂停：%s 无量/容量（%s）" % (m, (res.get("error") or "")[:100]))
                     break
@@ -450,7 +661,8 @@ def api_data(conn, days=0):
            JOIN (SELECT requested, MAX(ts) mts FROM probes GROUP BY requested) x
              ON x.requested=p.requested AND x.mts=p.ts""")}
     probe_stats = []
-    for m in list(AUTO_MODELS) + [k for k in pstats if k not in AUTO_MODELS]:
+    targets = auto_targets()
+    for m in targets + [k for k in pstats if k not in targets]:
         a, b = pstats.get(m, {}), latest.get(m, {})
         probe_stats.append({"model": m, "served": b.get("served") or "",
                             "ok": a.get("ok", 0), "swapped": a.get("swapped", 0),
@@ -474,6 +686,7 @@ def api_data(conn, days=0):
         "probe_summary": {"total": probe_summary["n"], "swapped": probe_summary["swapped"]},
         "probe_stats": probe_stats,
         "auto": auto_state(),
+        "catalog": catalog_state(),
     }
 
 
@@ -560,9 +773,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        try:
+            self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            log("GET 请求失败:\n" + traceback.format_exc())
+            self._json({"error": "本地服务处理请求失败，请查看服务日志"}, 500)
+
+    def _get(self):
         import urllib.parse
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/api/health":
+            self._json({"service": "codex-model-watch", "status": "ok", "pid": os.getpid()})
+            return
+        if path == "/api/models":
+            self._json(catalog_state())
+            return
         if path in ("/", "/index.html"):
             data = load_index()
             self.send_response(200)
@@ -573,30 +801,51 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if path == "/api/data":
-            global g_last_scan
             qs = urllib.parse.parse_qs(parsed.query)
             try:
                 days = int((qs.get("days") or ["0"])[0])
             except ValueError:
                 days = 0
             with g_lock:
-                if not g_state["demo"] and time.time() - g_last_scan > 20:
-                    scan_sessions(conn(), g_args.codex_home, g_args.max_age_days)
-                    g_last_scan = time.time()
-                self._json(api_data(conn(), days))
+                data = api_data(conn(), days)
+            self._json(data)
             return
-        self.send_response(404)
-        self.end_headers()
+        self._json({"error": "接口不存在"}, 404)
 
     def do_POST(self):
-        path0 = self.path.split("?")[0]
-        if path0 == "/api/auto":
+        try:
+            self._post()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            log("POST 请求失败:\n" + traceback.format_exc())
+            self._json({"error": "本地服务处理请求失败，请查看服务日志"}, 500)
+
+    def _body(self):
+        try:
             length = int(self.headers.get("Content-Length") or 0)
-            try:
-                body = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                body = {}
-            action = (body.get("action") or "").strip()
+            if length < 0 or length > 4096:
+                raise ValueError("请求体过大")
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            return body
+        except (ValueError, TypeError):
+            self._json({"error": "请求体必须是小于 4KB 的 JSON 对象"}, 400)
+            return None
+
+    def _post(self):
+        path0 = self.path.split("?")[0]
+        if path0 == "/api/models/refresh":
+            if g_catalog is not None:
+                g_catalog.request_refresh()
+            self._json(catalog_state(), 202)
+            return
+        if path0 == "/api/auto":
+            body = self._body()
+            if body is None:
+                return
+            action = body.get("action")
             if action == "start":
                 set_auto_enabled(True)
             elif action == "pause":
@@ -607,20 +856,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(auto_state())
             return
         if path0 == "/api/probe":
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                body = json.loads(self.rfile.read(length) or b"{}")
-            except Exception:
-                body = {}
-            model = (body.get("model") or "").strip()
-            if not model:
-                self._json({"error": "缺少 model"}, 400)
+            body = self._body()
+            if body is None:
                 return
-            result = run_probe(g_args.codex_home, model)
+            model = body.get("model")
+            if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model.strip()):
+                self._json({"error": "model 必须是有效模型名"}, 400)
+                return
+            result = run_probe(g_args.codex_home, model.strip())
             self._json(result)
             return
-        self.send_response(404)
-        self.end_headers()
+        self._json({"error": "接口不存在"}, 404)
 
 
 # ---------------------------------------------------------------- 入口
@@ -642,8 +888,27 @@ def db_path():
     return os.path.join(APP_DIR, "demo.db" if g_state["demo"] else "state.db")
 
 
+def scan_loop():
+    """Use a separate WAL writer: slow filesystem scans do not hold the API lock."""
+    global g_last_scan
+    scanner = None
+    while True:
+        try:
+            if scanner is None:
+                scanner = db_connect(db_path())
+            stats = scan_sessions(scanner, g_args.codex_home, g_args.max_age_days)
+            g_last_scan = time.time()
+            if stats.get("note"):
+                log(str(stats["note"]))
+        except Exception:
+            if scanner is not None:
+                scanner.rollback()
+            log("日志扫描异常（20 秒后重试）:\n" + traceback.format_exc())
+        time.sleep(20)
+
+
 def main():
-    global g_args, g_last_scan
+    global g_args, g_last_scan, g_catalog
     ap = argparse.ArgumentParser(description="codex-model-watch —— 本地监控 Codex 模型使用/额度/拒单，并探测模型偷换")
     ap.add_argument("--port", type=int, default=8787, help="本地网页端口（默认 8787）")
     ap.add_argument("--codex-home", default=os.path.join(HOME, ".codex"), help="Codex 主目录（默认 ~/.codex）")
@@ -655,18 +920,10 @@ def main():
     g_state["demo"] = g_args.demo
 
     conn_ = conn()
-    with g_lock:
-        if not g_args.demo:
-            stats = scan_sessions(conn_, g_args.codex_home, g_args.max_age_days)
-        else:
-            stats = {"files": 0}
-        g_last_scan = time.time()
-    n_turn = conn_.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
-    n_probe = conn_.execute("SELECT COUNT(*) FROM probes").fetchone()[0]
-    log("已解析 %d 个文件，累计 %d 轮会话、%d 次探针" % (stats.get("files", 0), n_turn, n_probe))
-    if stats.get("note"):
-        log(str(stats["note"]))
     if g_args.scan_only:
+        with g_lock:
+            if not g_args.demo:
+                scan_sessions(conn_, g_args.codex_home, g_args.max_age_days)
         top = conn_.execute("""SELECT served, COUNT(*) n FROM turns GROUP BY served
                                ORDER BY n DESC LIMIT 5""").fetchall()
         for r in top:
@@ -674,7 +931,14 @@ def main():
         return
 
     server = ThreadingHTTPServer(("127.0.0.1", g_args.port), Handler)
-    threading.Thread(target=auto_probe_loop, daemon=True).start()
+    g_catalog = ModelCatalog(g_args.codex_home, APP_DIR, demo=g_args.demo)
+    threading.Thread(target=g_catalog.loop, daemon=True).start()
+    if not g_args.demo:
+        threading.Thread(target=scan_loop, daemon=True).start()
+        threading.Thread(target=auto_probe_loop, daemon=True).start()
+    n_turn = conn_.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+    n_probe = conn_.execute("SELECT COUNT(*) FROM probes").fetchone()[0]
+    log("数据库累计 %d 轮会话、%d 次探针；后台扫描已启动" % (n_turn, n_probe))
     url = "http://127.0.0.1:%d" % g_args.port
     log("面板地址: %s  （PID %d，Ctrl+C 退出）" % (url, os.getpid()))
     if not g_args.no_open:

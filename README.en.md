@@ -67,6 +67,30 @@ returned in the SSE `response.created` event:
 Each probe costs a tiny amount of quota (one "hi"). Trigger it from the dashboard with one
 click, or schedule it (e.g. every 2 hours) to observe swap windows over time.
 
+### 3. Available model catalog (read-only)
+
+Every 5 minutes, the tool reads `chatgpt.com/backend-api/codex/models` and gets the client
+version from the local Codex cache. The catalog request uses the current Codex login and
+only reads which models are available to the account. It sends no inference request and
+uses no inference quota. The dashboard refreshes the catalog view every 10 seconds; the
+"Refresh models" button requests an immediate update. The model picker lists available
+models and still accepts a manually entered name. Auto mode probes at most the newest
+available `sol` and `astra` models, one of each. You can turn auto mode off and use manual
+probes.
+
+The catalog comes from a Codex internal endpoint, so its format may change. If a request
+fails, the tool keeps the last successful account-bound catalog it fetched and shows its
+cached status. Models found only in Codex's own cache are unverified candidates. Switching
+Codex accounts clears the old account's verified catalog. The dashboard shows the source,
+status and update time. Demo mode stays offline and does not read the real catalog or run
+real probes.
+
+OpenAI's [Sign in with ChatGPT models guide](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+describes loading an account-specific live catalog and refreshing it when the account
+changes. That guide documents the public `api.openai.com/v1/models` endpoint. This tool's
+Codex `backend-api` endpoint is an internal implementation observed locally; OpenAI does
+not document it there as a stable public API.
+
 ## Quick start
 
 Requires Python 3.8+ (standard library only — nothing to pip install). Windows / macOS / Linux.
@@ -100,6 +124,28 @@ Your browser opens `http://127.0.0.1:8787` automatically.
 The database lives at `~/.codex-model-watch/state.db` (SQLite). Repeated starts parse
 incrementally — nothing is counted twice.
 
+### Background running on macOS
+
+`watch.sh` asks a launchd-managed supervisor to keep the dashboard process healthy. It
+runs only after you start it manually. It does not configure startup or login launch. The
+plist stays at `~/.codex-model-watch/com.codex-model-watch.plist`; it is not placed in
+`~/Library/LaunchAgents`.
+
+```bash
+./watch.sh start    # Start and supervise manually
+./watch.sh status   # Check supervisor and dashboard health
+./watch.sh restart  # Restart and reload the current configuration
+./watch.sh stop     # Stop intentionally; do not restart it
+./watch.sh          # Start manually and open the browser
+```
+
+Closing the terminal does not stop the service. If the dashboard process exits or fails
+consecutive health checks, `service_supervisor.py` restarts it. launchd restarts the
+supervisor if it exits. Runtime status, start and stop records are written to
+`~/.codex-model-watch/watch.log`. After logging out or restarting the Mac, run
+`./watch.sh start` manually again. Manual start or stop also moves any confirmed legacy
+login agent out of the startup directory and keeps a backup in the state directory.
+
 ## Using the probe
 
 1. Log in with Codex normally once (so `~/.codex/auth.json` exists and is fresh);
@@ -111,7 +157,8 @@ incrementally — nothing is counted twice.
 ## Privacy
 
 - All parsing, aggregation and storage happen on your machine; the dashboard binds to `127.0.0.1` only;
-- The only outbound request is the **probe you trigger manually** (to your own Codex backend);
+- Outbound requests include periodic read-only model-catalog refreshes and probe requests that you trigger manually or enable in auto mode. They go to your Codex backend and use the existing login;
+- Model-catalog requests only read model availability and use no inference quota. Probes send one minimal inference request and use a small amount of quota;
 - No credentials, telemetry or phone-home anywhere in the code.
 
 ## Known limitations

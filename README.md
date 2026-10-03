@@ -63,6 +63,14 @@ Codex 会把每一轮会话事件写入本地文件：
 
 每次探针只消耗极少量额度（一条 "hi"），面板上点一下即可，也可以自己挂 cron 定时跑。
 
+### 3. 可用模型目录（只读）
+
+工具会每 5 分钟读取 `chatgpt.com/backend-api/codex/models`，并从本机 Codex 缓存读取客户端版本。目录请求使用当前 Codex 登录态，只读取账户可用模型，不发送推理请求，也不消耗推理额度。面板每 10 秒更新目录；「刷新模型」按钮可立即请求更新。模型选择框会列出可用模型，也允许手动输入其他名称。自动模式只探测当前目录里最新的 `sol` 和 `astra` 模型，最多两个；也可关闭自动模式并保留手动探针。
+
+目录来自 Codex 内部接口，格式可能变化。请求失败时工具会保留本工具最近一次成功读取的账户目录并显示缓存状态；Codex 自身缓存中的模型只作为未验证候选。切换 Codex 账户会清除旧账户的有效目录。面板会显示目录来源、状态和更新时间。演示模式完全离线，不会读取真实目录或运行真实探针。
+
+OpenAI 的[模型文档](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)建议根据实时账户目录选择模型；文档示例使用公开的 `api.openai.com/v1/models`。本工具当前读取 Codex 的 `backend-api` 内部接口，这是本机实测行为，不保证为稳定公开接口。
+
 ## 快速开始
 
 要求：Python 3.8+（仅标准库，无需 pip install 任何东西）。Windows / macOS / Linux 均可。
@@ -95,6 +103,20 @@ python codex_model_watch.py --demo
 
 数据库存在 `~/.codex-model-watch/state.db`（SQLite），重复启动是增量解析，不会重复计数。
 
+### macOS 后台运行
+
+`watch.sh` 将网页进程交给 launchd 管理器监督。它只在你手动启动后运行；不会配置开机或登录自启。plist 保存在 `~/.codex-model-watch/com.codex-model-watch.plist`，不会写入 `~/Library/LaunchAgents`。
+
+```bash
+./watch.sh start    # 手动启动并托管
+./watch.sh status   # 检查管理器和网页健康状态
+./watch.sh restart  # 按当前配置重启并重新载入
+./watch.sh stop     # 主动停止，不再自动恢复
+./watch.sh          # 手动启动并打开浏览器
+```
+
+关闭终端不会停止服务。网页进程退出或连续健康检查失败时，`service_supervisor.py` 会恢复网页进程；launchd 会恢复退出的管理器。运行状态、启动和停止记录写入 `~/.codex-model-watch/watch.log`。注销或重启电脑后，需要再次手动运行 `./watch.sh start`。旧版本遗留的登录自启文件会在手动启动或停止时移入状态目录备份。
+
 ## 探针怎么用
 
 1. 先用 Codex 正常登录一次（保证 `~/.codex/auth.json` 存在且未过期）；
@@ -105,7 +127,8 @@ python codex_model_watch.py --demo
 ## 隐私
 
 - 所有解析、统计、存储都发生在本机；数据库在本机；网页只监听 `127.0.0.1`；
-- 唯一的外发请求是**你手动触发的探针**（发给你自己的 Codex 后端）；
+- 外发请求包括定时只读模型目录请求，以及你手动触发或启用自动模式后的探针请求；请求发送到你自己的 Codex 后端并使用现有登录态；
+- 模型目录请求只读取可用模型，不消耗推理额度；探针会发送一条最小推理请求并消耗少量额度；
 - 仓库代码里没有任何凭据、遥测或上报。
 
 ## 已知限制
